@@ -41,6 +41,8 @@ class IJEPATrainConfig:
     seed: int = 0
     device: str = "auto"
     compile: bool = False
+    amp: bool = False
+    amp_dtype: str = "float16"
     profile: bool = False
     profile_steps: int = 5
 
@@ -135,26 +137,63 @@ def unwrap_compiled(module: nn.Module) -> nn.Module:
     return getattr(module, "_orig_mod", module)
 
 
+def resolve_amp(config: IJEPATrainConfig, device: torch.device) -> tuple[bool, torch.dtype]:
+    if config.amp_dtype == "float16":
+        amp_dtype = torch.float16
+    elif config.amp_dtype == "bfloat16":
+        amp_dtype = torch.bfloat16
+    else:
+        raise ValueError("amp_dtype must be 'float16' or 'bfloat16'")
+
+    if not config.amp:
+        return False, amp_dtype
+    if device.type != "cuda":
+        print(f"--amp ignored on device={device.type}: CUDA AMP is only enabled on CUDA.")
+        return False, amp_dtype
+    return True, amp_dtype
+
+
+def build_grad_scaler(
+    device: torch.device,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype,
+) -> torch.amp.GradScaler:
+    return torch.amp.GradScaler(
+        device="cuda" if device.type == "cuda" else "cpu",
+        enabled=amp_enabled and device.type == "cuda" and amp_dtype == torch.float16,
+    )
+
+
 def train_one_step(
     batch: dict[str, torch.Tensor | list[torch.Tensor]],
     encoder: VisionTransformer,
     criterion: LeJEPALoss,
     optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
     device: torch.device,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     images = batch["images"].to(device, non_blocking=True)
     context_masks = batch["context_masks"].to(device, non_blocking=True)
     target_masks = [mask.to(device, non_blocking=True) for mask in batch["target_masks"]]
 
-    tokens = encoder.forward_tokens(images)
-    context_embedding = pool_block_tokens(tokens, context_masks)
-    target_embeddings = [pool_block_tokens(tokens, mask) for mask in target_masks]
-    embeddings = torch.stack([context_embedding, *target_embeddings])
-    loss, components = criterion(embeddings, return_components=True)
-
     optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
+    with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+        tokens = encoder.forward_tokens(images)
+        context_embedding = pool_block_tokens(tokens, context_masks)
+        target_embeddings = [pool_block_tokens(tokens, mask) for mask in target_masks]
+        embeddings = torch.stack([context_embedding, *target_embeddings])
+        loss, components = criterion(embeddings, return_components=True)
+
+    if scaler.is_enabled():
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        loss.backward()
+        optimizer.step()
+
     # Keep the loss on-device; syncing to host here would stall the pipeline every
     # step. The caller materializes it with .item() only when it actually logs.
     detached_components = {name: value.detach() for name, value in components.items()}
@@ -175,7 +214,11 @@ def profile_training(config: IJEPATrainConfig) -> None:
         seed=config.seed,
     )
 
-    print(f"profile device={device} compile={config.compile}")
+    amp_enabled, amp_dtype = resolve_amp(config, device)
+    print(
+        f"profile device={device} compile={config.compile} "
+        f"amp={amp_enabled} amp_dtype={config.amp_dtype}"
+    )
     print(f"profile_steps={config.profile_steps} batch_size={config.batch_size}")
 
     iterator = iter(loader)
@@ -209,6 +252,7 @@ def profile_training(config: IJEPATrainConfig) -> None:
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
+    scaler = build_grad_scaler(device, amp_enabled, amp_dtype)
 
     encoder.train()
 
@@ -222,23 +266,31 @@ def profile_training(config: IJEPATrainConfig) -> None:
         sync_device(device)
         after_transfer = time.perf_counter()
 
-        tokens = encoder.forward_tokens(images)
+        with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+            tokens = encoder.forward_tokens(images)
         sync_device(device)
         after_encoder = time.perf_counter()
 
-        context_embedding = pool_block_tokens(tokens, context_masks)
-        target_embeddings = [pool_block_tokens(tokens, mask) for mask in target_masks]
-        embeddings = torch.stack([context_embedding, *target_embeddings])
+        with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+            context_embedding = pool_block_tokens(tokens, context_masks)
+            target_embeddings = [pool_block_tokens(tokens, mask) for mask in target_masks]
+            embeddings = torch.stack([context_embedding, *target_embeddings])
         sync_device(device)
         after_pool = time.perf_counter()
 
-        loss, components = criterion(embeddings, return_components=True)
+        with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+            loss, components = criterion(embeddings, return_components=True)
         sync_device(device)
         after_loss = time.perf_counter()
 
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
         sync_device(device)
         after_backward = time.perf_counter()
 
@@ -246,6 +298,7 @@ def profile_training(config: IJEPATrainConfig) -> None:
             f"profile_step={step} loss={float(loss.detach().cpu()):.6f} "
             f"invariance={float(components['invariance'].detach().cpu()):.6f} "
             f"sigreg={float(components['sigreg'].detach().cpu()):.6f} "
+            f"amp_scale={scaler.get_scale():.1f} "
             f"transfer={after_transfer - start:.4f} "
             f"encoder={after_encoder - after_transfer:.4f} "
             f"pool={after_pool - after_encoder:.4f} "
@@ -310,6 +363,7 @@ def train(config: IJEPATrainConfig) -> None:
     encoder = build_encoder(config, device)
     criterion = LeJEPALoss(num_global_views=1).to(device)
     do_compile = resolve_compile(config, device)
+    amp_enabled, amp_dtype = resolve_amp(config, device)
     encoder = maybe_compile(encoder, do_compile)
 
     optimizer = torch.optim.AdamW(
@@ -317,10 +371,14 @@ def train(config: IJEPATrainConfig) -> None:
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
+    scaler = build_grad_scaler(device, amp_enabled, amp_dtype)
 
     output_dir = Path(config.output_dir)
     print(f"device={device} split={config.split} batches_per_epoch={len(loader)}")
-    print(f"training_steps={total_steps} batch_size={config.batch_size}")
+    print(
+        f"training_steps={total_steps} batch_size={config.batch_size} "
+        f"amp={amp_enabled} amp_dtype={config.amp_dtype}"
+    )
 
     global_step = 0
     encoder.train()
@@ -342,7 +400,10 @@ def train(config: IJEPATrainConfig) -> None:
                 encoder=encoder,
                 criterion=criterion,
                 optimizer=optimizer,
+                scaler=scaler,
                 device=device,
+                amp_enabled=amp_enabled,
+                amp_dtype=amp_dtype,
             )
 
             if global_step % config.log_every == 0:
@@ -410,6 +471,18 @@ def parse_args() -> IJEPATrainConfig:
         action="store_true",
         default=IJEPATrainConfig.compile,
         help="Enable torch.compile (used only on CUDA; ignored on MPS/CPU where it is slower).",
+    )
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        default=IJEPATrainConfig.amp,
+        help="Enable CUDA automatic mixed precision for forward/loss and optimizer stepping.",
+    )
+    parser.add_argument(
+        "--amp-dtype",
+        choices=["float16", "bfloat16"],
+        default=IJEPATrainConfig.amp_dtype,
+        help="Autocast dtype to use when --amp is enabled on CUDA.",
     )
     parser.add_argument("--profile", action="store_true", default=IJEPATrainConfig.profile)
     parser.add_argument("--profile-steps", type=int, default=IJEPATrainConfig.profile_steps)
